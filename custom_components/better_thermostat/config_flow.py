@@ -41,6 +41,7 @@ from .utils.const import (
     CONF_PROTECT_OVERHEATING,
     CONF_SENSOR,
     CONF_SENSOR_WINDOW,
+    CONF_SLOW_NEGATIVE_OFFSET,
     CONF_TARGET_TEMP_STEP,
     CONF_TOLERANCE,
     CONF_VALVE_MAINTENANCE,
@@ -274,6 +275,11 @@ def _build_advanced_fields(
     ] = bool
     ordered[
         vol.Optional(
+            CONF_SLOW_NEGATIVE_OFFSET, default=get_bool(CONF_SLOW_NEGATIVE_OFFSET, False)
+        )
+    ] = bool
+    ordered[
+        vol.Optional(
             CONF_NO_SYSTEM_MODE_OFF, default=get_bool(CONF_NO_SYSTEM_MODE_OFF, False)
         )
     ] = bool
@@ -307,6 +313,9 @@ def _normalize_advanced_submission(
     )
     normalized[CONF_PROTECT_OVERHEATING] = _as_bool(
         normalized.get(CONF_PROTECT_OVERHEATING), False
+    )
+    normalized[CONF_SLOW_NEGATIVE_OFFSET] = _as_bool(
+        normalized.get(CONF_SLOW_NEGATIVE_OFFSET), False
     )
     normalized[CONF_NO_SYSTEM_MODE_OFF] = _as_bool(
         normalized.get(CONF_NO_SYSTEM_MODE_OFF), False

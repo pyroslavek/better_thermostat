@@ -651,6 +651,9 @@ class BetterThermostat(ClimateEntity, RestoreEntity, ABC):
                 "last_hvac_mode": None,
                 "last_current_temperature": None,
                 "last_calibration": None,
+                "negative_offset_anchor": None,
+                "negative_offset_anchor_time": None,
+                "negative_offset_target": None,
             }
 
         def on_remove():

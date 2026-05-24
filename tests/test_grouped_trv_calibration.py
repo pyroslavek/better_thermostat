@@ -21,6 +21,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from custom_components.better_thermostat.utils.const import (
+    CalibrationMode,
+    CalibrationType,
+    CONF_SLOW_NEGATIVE_OFFSET,
+)
+
 
 @pytest.fixture
 def anyio_backend():
@@ -427,3 +433,196 @@ class TestCalibrationReceivedReset:
             assert (
                 mock_bt_instance.real_trvs[entity_id]["calibration_received"] is False
             )
+
+
+class TestSlowNegativeOffset:
+    """Tests for staged negative offset writes."""
+
+    @pytest.mark.anyio
+    async def test_negative_offset_is_ramped_when_enabled(self, mock_bt_instance):
+        """Large negative offset changes should be limited by elapsed time."""
+        from custom_components.better_thermostat.utils.controlling import control_trv
+
+        entity_id = "climate.trv_1"
+        mock_bt_instance.real_trvs[entity_id]["advanced"] = {
+            "calibration": CalibrationType.LOCAL_BASED,
+            "calibration_mode": CalibrationMode.DEFAULT,
+            CONF_SLOW_NEGATIVE_OFFSET: True,
+        }
+        mock_bt_instance.real_trvs[entity_id]["local_calibration_step"] = 0.5
+
+        mock_trv_state = MagicMock()
+        mock_trv_state.state = "heat"
+        mock_trv_state.attributes = {"temperature": 21.0}
+        mock_bt_instance.hass.states.get.return_value = mock_trv_state
+
+        with (
+            patch(
+                "custom_components.better_thermostat.utils.controlling.get_current_offset",
+                new_callable=AsyncMock,
+            ) as mock_get_offset,
+            patch(
+                "custom_components.better_thermostat.utils.controlling.convert_outbound_states"
+            ) as mock_convert,
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_offset",
+                new_callable=AsyncMock,
+            ) as mock_set_offset,
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_temperature",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_hvac_mode",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_valve",
+                new_callable=AsyncMock,
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch(
+                "custom_components.better_thermostat.utils.controlling._get_monotonic_time",
+                side_effect=[100.0, 340.0],
+            ),
+        ):
+            mock_get_offset.return_value = 2.0
+            mock_convert.return_value = {
+                "temperature": 21.0,
+                "local_temperature_calibration": -4.0,
+                "local_temperature": 20.0,
+                "system_mode": "heat",
+            }
+
+            await control_trv(mock_bt_instance, entity_id)
+
+            mock_set_offset.assert_called_once_with(mock_bt_instance, entity_id, 1.5)
+            assert (
+                mock_bt_instance.real_trvs[entity_id]["calibration_received"] is False
+            )
+
+    @pytest.mark.anyio
+    async def test_negative_offset_ramp_advances_across_cycles(self, mock_bt_instance):
+        """The same negative target should continue stepping down over time."""
+        from custom_components.better_thermostat.utils.controlling import control_trv
+
+        entity_id = "climate.trv_1"
+        mock_bt_instance.real_trvs[entity_id]["advanced"] = {
+            "calibration": CalibrationType.LOCAL_BASED,
+            "calibration_mode": CalibrationMode.DEFAULT,
+            CONF_SLOW_NEGATIVE_OFFSET: True,
+        }
+        mock_bt_instance.real_trvs[entity_id]["local_calibration_step"] = 0.5
+
+        mock_trv_state = MagicMock()
+        mock_trv_state.state = "heat"
+        mock_trv_state.attributes = {"temperature": 21.0}
+        mock_bt_instance.hass.states.get.return_value = mock_trv_state
+
+        with (
+            patch(
+                "custom_components.better_thermostat.utils.controlling.get_current_offset",
+                new_callable=AsyncMock,
+            ) as mock_get_offset,
+            patch(
+                "custom_components.better_thermostat.utils.controlling.convert_outbound_states"
+            ) as mock_convert,
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_offset",
+                new_callable=AsyncMock,
+            ) as mock_set_offset,
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_temperature",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_hvac_mode",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_valve",
+                new_callable=AsyncMock,
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+            patch(
+                "custom_components.better_thermostat.utils.controlling._get_monotonic_time",
+                side_effect=[100.0, 340.0, 580.0],
+            ),
+        ):
+            mock_get_offset.return_value = 2.0
+            mock_convert.return_value = {
+                "temperature": 21.0,
+                "local_temperature_calibration": -4.0,
+                "local_temperature": 20.0,
+                "system_mode": "heat",
+            }
+
+            await control_trv(mock_bt_instance, entity_id)
+
+            mock_bt_instance.real_trvs[entity_id]["last_calibration"] = 1.5
+            mock_bt_instance.real_trvs[entity_id]["calibration_received"] = True
+            mock_get_offset.return_value = 1.5
+
+            await control_trv(mock_bt_instance, entity_id)
+
+            assert mock_set_offset.call_count == 2
+            assert mock_set_offset.await_args_list[1].args == (
+                mock_bt_instance,
+                entity_id,
+                1.0,
+            )
+
+    @pytest.mark.anyio
+    async def test_positive_offset_stays_immediate_when_enabled(self, mock_bt_instance):
+        """Positive corrections should bypass the mitigation."""
+        from custom_components.better_thermostat.utils.controlling import control_trv
+
+        entity_id = "climate.trv_1"
+        mock_bt_instance.real_trvs[entity_id]["advanced"] = {
+            "calibration": CalibrationType.LOCAL_BASED,
+            "calibration_mode": CalibrationMode.DEFAULT,
+            CONF_SLOW_NEGATIVE_OFFSET: True,
+        }
+
+        mock_trv_state = MagicMock()
+        mock_trv_state.state = "heat"
+        mock_trv_state.attributes = {"temperature": 21.0}
+        mock_bt_instance.hass.states.get.return_value = mock_trv_state
+
+        with (
+            patch(
+                "custom_components.better_thermostat.utils.controlling.get_current_offset",
+                new_callable=AsyncMock,
+            ) as mock_get_offset,
+            patch(
+                "custom_components.better_thermostat.utils.controlling.convert_outbound_states"
+            ) as mock_convert,
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_offset",
+                new_callable=AsyncMock,
+            ) as mock_set_offset,
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_temperature",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_hvac_mode",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "custom_components.better_thermostat.utils.controlling.set_valve",
+                new_callable=AsyncMock,
+            ),
+            patch("asyncio.sleep", new_callable=AsyncMock),
+        ):
+            mock_get_offset.return_value = 2.0
+            mock_convert.return_value = {
+                "temperature": 21.0,
+                "local_temperature_calibration": 3.0,
+                "local_temperature": 20.0,
+                "system_mode": "heat",
+            }
+
+            await control_trv(mock_bt_instance, entity_id)
+
+            mock_set_offset.assert_called_once_with(mock_bt_instance, entity_id, 3.0)

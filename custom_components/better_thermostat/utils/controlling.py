@@ -20,10 +20,14 @@ from custom_components.better_thermostat.model_fixes.model_quirks import (
 from custom_components.better_thermostat.utils.const import (
     CalibrationMode,
     CalibrationType,
+    CONF_SLOW_NEGATIVE_OFFSET,
 )
 from custom_components.better_thermostat.utils.helpers import convert_to_float
 
 _LOGGER = logging.getLogger(__name__)
+
+NEGATIVE_OFFSET_LIMIT_DEGREES = 5.0
+NEGATIVE_OFFSET_WINDOW_SECONDS = 40 * 60
 
 
 class TaskManager:
@@ -39,6 +43,81 @@ class TaskManager:
         self.tasks.add(task)
         task.add_done_callback(self.tasks.discard)
         return task
+
+
+def _get_monotonic_time() -> float:
+    return asyncio.get_running_loop().time()
+
+
+def _clear_negative_offset_ramp(trv_state: dict) -> None:
+    trv_state["negative_offset_anchor"] = None
+    trv_state["negative_offset_anchor_time"] = None
+    trv_state["negative_offset_target"] = None
+
+
+def _get_ramped_offset(
+    trv_state: dict,
+    current_offset: float,
+    target_offset: float,
+    *,
+    enabled: bool,
+    calibration_type: CalibrationType,
+) -> float:
+    if not enabled or calibration_type != CalibrationType.LOCAL_BASED:
+        _clear_negative_offset_ramp(trv_state)
+        return target_offset
+
+    last_commanded = trv_state.get("last_calibration")
+    try:
+        last_commanded_value = float(last_commanded)
+    except (TypeError, ValueError):
+        last_commanded_value = current_offset
+
+    if target_offset >= last_commanded_value:
+        _clear_negative_offset_ramp(trv_state)
+        return target_offset
+
+    anchor_offset = trv_state.get("negative_offset_anchor")
+    anchor_time = trv_state.get("negative_offset_anchor_time")
+    ramp_target = trv_state.get("negative_offset_target")
+
+    if (
+        anchor_offset is None
+        or anchor_time is None
+        or ramp_target is None
+        or target_offset > float(ramp_target)
+        or last_commanded_value > float(anchor_offset)
+    ):
+        anchor_offset = last_commanded_value
+        anchor_time = _get_monotonic_time()
+
+    trv_state["negative_offset_anchor"] = float(anchor_offset)
+    trv_state["negative_offset_anchor_time"] = float(anchor_time)
+    trv_state["negative_offset_target"] = target_offset
+
+    elapsed = max(0.0, _get_monotonic_time() - float(anchor_time))
+    max_drop = (
+        elapsed * NEGATIVE_OFFSET_LIMIT_DEGREES / NEGATIVE_OFFSET_WINDOW_SECONDS
+    )
+    step_value = trv_state.get("local_calibration_step")
+    try:
+        step_value = float(step_value)
+    except (TypeError, ValueError):
+        step_value = None
+
+    if step_value is not None and step_value > 0:
+        steps_down = int(max_drop / step_value)
+        allowed_offset = float(anchor_offset) - (steps_down * step_value)
+    else:
+        allowed_offset = float(anchor_offset) - max_drop
+
+    ramped_offset = max(target_offset, allowed_offset)
+
+    if ramped_offset <= target_offset:
+        _clear_negative_offset_ramp(trv_state)
+        return target_offset
+
+    return ramped_offset
 
 
 async def control_queue(self):
@@ -545,18 +624,39 @@ async def control_trv(self, heater_entity_id=None):
             _old_calibration = self.real_trvs[heater_entity_id].get(
                 "last_calibration", _current_calibration
             )
+            _slow_negative_offset = self.real_trvs[heater_entity_id]["advanced"].get(
+                CONF_SLOW_NEGATIVE_OFFSET, False
+            )
 
             if self.real_trvs[heater_entity_id][
                 "calibration_received"
             ] is True and float(_old_calibration) != float(_calibration):
+                _outgoing_calibration = _get_ramped_offset(
+                    self.real_trvs[heater_entity_id],
+                    _current_calibration,
+                    _calibration,
+                    enabled=_slow_negative_offset,
+                    calibration_type=_calibration_type,
+                )
+                if float(_old_calibration) == float(_outgoing_calibration):
+                    _LOGGER.debug(
+                        "better_thermostat %s: holding local_temperature_calibration for %s at %s while ramping toward %s",
+                        self.device_name,
+                        heater_entity_id,
+                        _old_calibration,
+                        _calibration,
+                    )
+                    return True
                 _LOGGER.debug(
-                    "better_thermostat %s: TO TRV set_local_temperature_calibration: %s from: %s to: %s",
+                    "better_thermostat %s: TO TRV set_local_temperature_calibration: %s from: %s to: %s (target=%s, slow_negative_offset=%s)",
                     self.device_name,
                     heater_entity_id,
                     _old_calibration,
+                    _outgoing_calibration,
                     _calibration,
+                    _slow_negative_offset,
                 )
-                await set_offset(self, heater_entity_id, _calibration)
+                await set_offset(self, heater_entity_id, _outgoing_calibration)
                 self.real_trvs[heater_entity_id]["calibration_received"] = False
 
         # set new target temperature
@@ -780,6 +880,9 @@ async def control_trv(self, heater_entity_id=None):
         _old_calibration = self.real_trvs[heater_entity_id].get(
             "last_calibration", _current_calibration
         )
+        _slow_negative_offset = self.real_trvs[heater_entity_id]["advanced"].get(
+            CONF_SLOW_NEGATIVE_OFFSET, False
+        )
 
         # Fix for grouped TRVs: If current calibration already matches target,
         # reset calibration_received to True. This handles the case where the
@@ -802,14 +905,33 @@ async def control_trv(self, heater_entity_id=None):
         if self.real_trvs[heater_entity_id]["calibration_received"] is True and float(
             _old_calibration
         ) != float(_calibration):
+            _outgoing_calibration = _get_ramped_offset(
+                self.real_trvs[heater_entity_id],
+                _current_calibration,
+                _calibration,
+                enabled=_slow_negative_offset,
+                calibration_type=_calibration_type,
+            )
+            if float(_old_calibration) == float(_outgoing_calibration):
+                _LOGGER.debug(
+                    "better_thermostat %s: holding local_temperature_calibration for %s at %s while ramping toward %s",
+                    self.device_name,
+                    heater_entity_id,
+                    _old_calibration,
+                    _calibration,
+                )
+                self.real_trvs[heater_entity_id]["ignore_trv_states"] = False
+                return True
             _LOGGER.debug(
-                "better_thermostat %s: TO TRV set_local_temperature_calibration: %s from: %s to: %s",
+                "better_thermostat %s: TO TRV set_local_temperature_calibration: %s from: %s to: %s (target=%s, slow_negative_offset=%s)",
                 self.device_name,
                 heater_entity_id,
                 _old_calibration,
+                _outgoing_calibration,
                 _calibration,
+                _slow_negative_offset,
             )
-            await set_offset(self, heater_entity_id, _calibration)
+            await set_offset(self, heater_entity_id, _outgoing_calibration)
             self.real_trvs[heater_entity_id]["calibration_received"] = False
 
     # set new target temperature
